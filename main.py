@@ -1,167 +1,119 @@
-import pandas as pd
 import torch
-from torch.utils.data import Dataset
-from transformers import (
-    BertTokenizer,
-    BertForSequenceClassification,
-    Trainer,
-    TrainingArguments,
-    EarlyStoppingCallback
-)
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-import os
+from transformers import BertTokenizer, BertForSequenceClassification
 import pickle
+import os
 
-# Load the dataset
-df = pd.read_csv("balanced_feedback_dataset.csv")
-print("Dataset preview:")
-print(df.head())
+def analyze_sentiment(user_input, model_dir="./saved_model", verbose=False):
+    """
+    Analyze user feedback to determine sentiment (positive, negative, or neutral).
 
-# Map sentiment labels to integers
-label_mapping = {"negative": 0, "neutral": 1, "positive": 2}
-df['label'] = df['label'].map(label_mapping)
+    Args:
+        user_input (str): The user's feedback text
+        model_dir (str): Directory where the model is saved
+        verbose (bool): Whether to print detailed information
 
-# Prepare texts and labels using the correct column names
-texts = df['feedback'].tolist()
-labels = df['label'].tolist()
+    Returns:
+        dict: Analysis results including sentiment
+    """
+    try:
+        # Load the saved model, tokenizer, and label mapping
+        model = BertForSequenceClassification.from_pretrained(model_dir)
+        tokenizer = BertTokenizer.from_pretrained(model_dir)
 
-# Split the dataset into training and validation sets
-train_texts, val_texts, train_labels, val_labels = train_test_split(
-    texts, labels, test_size=0.2, random_state=42
-)
+        with open(os.path.join(model_dir, "label_mapping.pkl"), "rb") as f:
+            label_mapping = pickle.load(f)
 
-# Load the pre-trained BERT tokenizer and model
-model_name = "bert-base-uncased"
-tokenizer = BertTokenizer.from_pretrained(model_name)
-model = BertForSequenceClassification.from_pretrained(model_name, num_labels=3)
+        # Create reverse mapping (from integers to labels)
+        reverse_mapping = {v: k for k, v in label_mapping.items()}
 
-# Define a custom Dataset class
-class FeedbackDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length=128):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        text = self.texts[idx]
-        label = self.labels[idx]
-        encoding = self.tokenizer(
-            text,
+        # Tokenize input text
+        inputs = tokenizer(
+            user_input,
             truncation=True,
             padding='max_length',
-            max_length=self.max_length,
+            max_length=128,
             return_tensors='pt'
         )
-        # Remove the extra batch dimension
-        item = {key: encoding[key].squeeze(0) for key in encoding}
-        item['labels'] = torch.tensor(label, dtype=torch.long)
-        return item
 
-# Create the PyTorch datasets
-train_dataset = FeedbackDataset(train_texts, train_labels, tokenizer)
-val_dataset = FeedbackDataset(val_texts, val_labels, tokenizer)
+        # Get sentiment prediction
+        with torch.no_grad():
+            outputs = model(**inputs)
+            predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
+            predicted_class = torch.argmax(predictions, dim=-1).item()
 
-# Define a compute_metrics function to evaluate accuracy
-def compute_metrics(pred):
-    labels = pred.label_ids
-    preds = pred.predictions.argmax(-1)
-    accuracy = accuracy_score(labels, preds)
-    return {"accuracy": accuracy}
+        # Get confidence score and sentiment label
+        confidence = predictions[0][predicted_class].item()
+        predicted_sentiment = reverse_mapping[predicted_class]
 
-# Set up training arguments with improvements
-training_args = TrainingArguments(
-    output_dir='./results',                # Where to store the final model
-    num_train_epochs=3,                    # Maximum number of training epochs
-    per_device_train_batch_size=16,        # Training batch size per device
-    per_device_eval_batch_size=64,         # Evaluation batch size per device
-    warmup_steps=500,                      # Warmup steps for the learning rate scheduler
-    weight_decay=0.01,                     # Weight decay for optimization
-    evaluation_strategy="epoch",           # Evaluate at the end of each epoch
-    save_strategy="epoch",                 # Save checkpoint at the end of each epoch
-    logging_dir='./logs',                  # Directory for logs
-    logging_steps=10,
-    load_best_model_at_end=True,           # Load the best model at the end of training
-    fp16=True,                             # Enable mixed precision training
-    report_to=None,                        # Disable logging integrations (like wandb) to reduce overhead
-    lr_scheduler_type="cosine",            # Use a cosine learning rate scheduler
-    learning_rate=2e-5,                    # Set a lower learning rate for fine-tuning
-)
+        # Get all sentiment scores
+        all_scores = {reverse_mapping[i]: score.item() for i, score in enumerate(predictions[0])}
 
-# Initialize the Trainer with early stopping callback
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    compute_metrics=compute_metrics,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
-)
+        # Prepare results
+        results = {
+            "text": user_input,
+            "sentiment": predicted_sentiment,
+            "confidence": round(confidence * 100, 1),
+            "detailed_scores": {k: round(v * 100, 1) for k, v in all_scores.items()} if verbose else None
+        }
 
-# Start training
-print("Starting training...")
-trainer.train()
+        return results
 
-# Evaluate the model on the validation set and print the results
-results = trainer.evaluate()
-print("Evaluation results:", results)
+    except Exception as e:
+        return {
+            "error": str(e),
+            "text": user_input,
+            "sentiment": "error"
+        }
 
-# Save the trained model and tokenizer
-output_dir = "./saved_model"
-os.makedirs(output_dir, exist_ok=True)
+def interactive_sentiment_analyzer(model_dir="./saved_model"):
+    """
+    Interactive command-line interface for analyzing sentiment in user feedback.
+    """
+    print("\n===== Sentiment Analyzer =====")
+    print("Type your text below, or 'quit' to exit.")
 
-print(f"Saving model to {output_dir}...")
-model.save_pretrained(output_dir)
-tokenizer.save_pretrained(output_dir)
+    while True:
+        print("\n")
+        user_input = input("Your text: ")
 
-# Save label mapping for future use
-with open(os.path.join(output_dir, "label_mapping.pkl"), "wb") as f:
-    pickle.dump(label_mapping, f)
+        if user_input.lower() in ['quit', 'exit', 'q']:
+            print("Thank you for using Sentiment Analyzer!")
+            break
 
-print("Model, tokenizer, and label mapping saved successfully!")
+        if not user_input.strip():
+            print("Please enter some text.")
+            continue
 
-# Create a helper function for prediction (you can save this to a separate file)
-def predict_sentiment(text, model_dir="./saved_model"):
-    # Load the saved model, tokenizer, and label mapping
-    loaded_model = BertForSequenceClassification.from_pretrained(model_dir)
-    loaded_tokenizer = BertTokenizer.from_pretrained(model_dir)
+        # Analyze the sentiment
+        result = analyze_sentiment(user_input, model_dir, verbose=True)
 
-    with open(os.path.join(model_dir, "label_mapping.pkl"), "rb") as f:
-        loaded_label_mapping = pickle.load(f)
+        if "error" in result:
+            print(f"Error: {result['error']}")
+            continue
 
-    # Create reverse mapping (from integers to labels)
-    reverse_mapping = {v: k for k, v in loaded_label_mapping.items()}
+        # Display results
+        print("\n----- Analysis Results -----")
+        print(f"Sentiment: {result['sentiment'].upper()} ({result['confidence']}% confidence)")
 
-    # Tokenize input text
-    inputs = loaded_tokenizer(
-        text,
-        truncation=True,
-        padding='max_length',
-        max_length=128,
-        return_tensors='pt'
-    )
+        # Show detailed sentiment scores
+        if result['detailed_scores']:
+            print("\nDetailed Sentiment Scores:")
+            for sentiment, score in result['detailed_scores'].items():
+                print(f"  {sentiment.capitalize()}: {score}%")
 
-    # Get prediction
-    with torch.no_grad():
-        outputs = loaded_model(**inputs)
-        predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        predicted_class = torch.argmax(predictions, dim=-1).item()
+        print("--------------------------")
 
-    # Get confidence score and label
-    confidence = predictions[0][predicted_class].item()
-    predicted_label = reverse_mapping[predicted_class]
+# Example usage in another script:
+"""
+from sentiment_analyzer import analyze_sentiment
 
-    return {
-        "text": text,
-        "label": predicted_label,
-        "confidence": confidence,
-        "all_scores": {reverse_mapping[i]: score.item() for i, score in enumerate(predictions[0])}
-    }
+# Analyze a single piece of text
+feedback = "I really enjoyed using this product!"
+result = analyze_sentiment(feedback)
+print(f"Sentiment: {result['sentiment']}")
+"""
 
-# Example usage of prediction function:
-# result = predict_sentiment("This product is amazing!")
-# print(result)
+# If running as a script, start the interactive interface
+if __name__ == "__main__":
+    model_directory = "./saved_model"  # Change this to your model directory if different
+    interactive_sentiment_analyzer(model_directory)
